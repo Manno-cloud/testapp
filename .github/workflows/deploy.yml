@@ -8,6 +8,15 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPOSITORY: testapp-dev-nginx
+  ECS_CLUSTER: testapp-dev-cluster
+  ECS_SERVICE: testapp-dev-service
+  ECS_TASK_FAMILY: testapp-dev-task
+  CONTAINER_NAME: app
+  CONTAINER_PORT: 80
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -16,52 +25,65 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Login to AWS via OIDC
+      # OIDC 認証（Secrets に ARN を保存）
+      - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::695394391597:role/GitHubActionsTerraformRole
-          aws-region: ap-northeast-1
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
+      # ECR ログイン
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # Docker Build
       - name: Build Docker Image
         run: |
-          docker build -t testapp-dev-nginx .
+          docker build -t $ECR_REPOSITORY .
 
-      - name: Tag Image
+      # Docker Tag
+      - name: Tag Docker Image
         run: |
-          docker tag testapp-dev-nginx:latest 695394391597.dkr.ecr.ap-northeast-1.amazonaws.com/testapp-dev-nginx:latest
+          docker tag $ECR_REPOSITORY:latest \
+            ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:latest
 
-      - name: Push to ECR
+      # ECR Push
+      - name: Push to Amazon ECR
         run: |
-          docker push 695394391597.dkr.ecr.ap-northeast-1.amazonaws.com/testapp-dev-nginx:latest
+          docker push \
+            ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:latest
 
-      - name: Register New Task Definition
+      # タスク定義 JSON 動的生成
+      - name: Generate New Task Definition
         run: |
-          FAMILY="testapp-dev-task"
-          IMAGE="695394391597.dkr.ecr.ap-northeast-1.amazonaws.com/testapp-dev-nginx:latest"
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}:latest"
 
-          NEW_TASK_DEF=$(jq -n \
-            --arg IMAGE "$IMAGE" \
+          jq -n \
+            --arg IMAGE "$IMAGE_URI" \
+            --arg FAMILY "$ECS_TASK_FAMILY" \
+            --arg EXEC_ROLE "${{ secrets.ECS_EXECUTION_ROLE_ARN }}" \
+            --arg TASK_ROLE "${{ secrets.ECS_TASK_ROLE_ARN }}" \
+            --arg REGION "$AWS_REGION" \
+            --arg CONTAINER "$CONTAINER_NAME" \
+            --argjson PORT $CONTAINER_PORT \
             '{
-              family: "testapp-dev-task",
+              family: $FAMILY,
               networkMode: "awsvpc",
               requiresCompatibilities: ["FARGATE"],
               cpu: "256",
               memory: "512",
-              executionRoleArn: "arn:aws:iam::695394391597:role/ecsTaskExecutionRole",
-              taskRoleArn: "arn:aws:iam::695394391597:role/ecsTaskRole",
+              executionRoleArn: $EXEC_ROLE,
+              taskRoleArn: $TASK_ROLE,
               containerDefinitions: [
                 {
-                  name: "app",
+                  name: $CONTAINER,
                   image: $IMAGE,
                   essential: true,
                   portMappings: [
                     {
-                      containerPort: 80,
-                      hostPort: 80,
+                      containerPort: PORT,
+                      hostPort: PORT,
                       protocol: "tcp"
                     }
                   ],
@@ -70,25 +92,24 @@ jobs:
                     options: {
                       "awslogs-create-group": "true",
                       "awslogs-group": "/ecs/testapp-dev",
-                      "awslogs-region": "ap-northeast-1",
+                      "awslogs-region": $REGION,
                       "awslogs-stream-prefix": "ecs"
                     }
                   }
                 }
               ]
-            }'
-          )
+            }' > new-task-def.json
 
-          echo "$NEW_TASK_DEF" > new-task-def.json
-
-      - name: Register task definition to ECS
+      # タスク定義登録
+      - name: Register Task Definition to ECS
         run: |
           aws ecs register-task-definition \
             --cli-input-json file://new-task-def.json
 
+      # ECS サービス更新
       - name: Update ECS Service
         run: |
           aws ecs update-service \
-            --cluster testapp-dev-cluster \
-            --service testapp-dev-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
             --force-new-deployment
